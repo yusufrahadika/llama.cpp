@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -50,6 +51,20 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+}
+
+static bool llama_model_is_qwen3_rank_splittable(const llama_model * model) {
+    if (model == nullptr) {
+        return false;
+    }
+
+    char arch[32] = { 0 };
+    const int32_t n = llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+
+    return n > 0 && (
+        strcmp(arch, "qwen3") == 0 ||
+        strcmp(arch, "qwen3vl") == 0
+    );
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -270,9 +285,22 @@ struct server_slot {
     bool can_split() const {
         GGML_ASSERT(task);
 
-        return
-            !task->need_embd() ||
-            (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
+        if (!task->need_embd()) {
+            return true;
+        }
+
+        if (!llama_get_memory(ctx_tgt)) {
+            return false;
+        }
+
+        const enum llama_pooling_type pooling_type = llama_pooling_type(ctx_tgt);
+
+        if (pooling_type == LLAMA_POOLING_TYPE_LAST) {
+            return true;
+        }
+
+        return pooling_type == LLAMA_POOLING_TYPE_RANK &&
+            llama_model_is_qwen3_rank_splittable(llama_get_model(ctx_tgt));
     }
 
     bool can_batch_with(server_slot & other_slot) const {
